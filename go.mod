@@ -3,7 +3,7 @@ module github.com/ekravo/Ekravo-review/v2
 go 1.26.10
 
 require (
-	github.com/odvcencio/gotreesitter v0.56.0
+	github.com/odvcencio/gotreesitter v0.57.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.61.1
 )
