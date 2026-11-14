@@ -16,7 +16,7 @@ RUN CGO_ENABLED=0 go build -trimpath \
 
 # git is required for monorepo partial clones and sparse checkout. The binary
 # itself is static; the shell is only present for git's helpers.
-FROM alpine:3.22
+FROM alpine:3.24
 
 RUN apk add --no-cache git ca-certificates \
     && addgroup -S ekravo \
