@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	pathpkg "path"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -270,7 +271,16 @@ func (a *App) enqueuePR(repo string, number int, force bool) error {
 }
 
 func (a *App) enqueueCommand(repo string, number int, command string) error {
+	// review/recheck run the same ReviewPR path as webhook deliveries, so they
+	// must share the PR's queue key: two concurrent reviews of one PR race on
+	// deletePrevious and the stored review row.
 	key := fmt.Sprintf("%s#%d#%s", repo, number, command)
+	if fields := strings.Fields(command); len(fields) > 0 {
+		cmd := strings.ToLower(fields[0])
+		if cmd == "review" || cmd == "recheck" {
+			return a.enqueuePR(repo, number, true)
+		}
+	}
 	err := a.pool.SubmitOrJoin(key, func(ctx context.Context) {
 		jobCtx, cancel := context.WithTimeout(ctx, reviewTimeout)
 		defer cancel()
@@ -310,7 +320,8 @@ func (a *App) ReviewPR(ctx context.Context, repo string, number int, force bool)
 	}
 
 	rc := a.repoConfig(ctx, repo)
-	files, incremental, since, err := a.diffFor(ctx, repo, pr, force)
+	prior := a.loadPrior(ctx, repo, number)
+	files, incremental, since, err := a.diffFor(ctx, repo, pr, force, prior)
 	if err != nil {
 		return err
 	}
@@ -339,6 +350,14 @@ func (a *App) ReviewPR(ctx context.Context, repo string, number int, force bool)
 		}
 	}
 	chunks := diff.ChunkFiles(parsed, min(a.cfg.LLM.ChunkChars, maxSectionChars))
+
+	// On an incremental re-review, blocking findings the new commits did not
+	// touch stay open; otherwise an unfixed blocker would silently approve.
+	var priorOpen, carried, touchedResolved []review.Finding
+	if incremental {
+		priorOpen = priorFindings(prior)
+		carried, touchedResolved = carryForward(priorOpen, parsed, rc.BlockOn)
+	}
 
 	var findings []review.Finding
 	var dropped []review.Dropped
@@ -379,8 +398,8 @@ func (a *App) ReviewPR(ctx context.Context, repo string, number int, force bool)
 		contextFiles += cstats.Files
 		contextMS += cstats.IndexMS
 
-		user := review.UserPromptWithContext(meta, manifest, repoCtx, text.String(),
-			i, len(sections), truncatedChunk, incremental)
+		user := review.UserPromptWithPrior(meta, manifest, repoCtx, text.String(),
+			i, len(sections), truncatedChunk, incremental, priorOpen)
 
 		a.metrics.LLMCalls.Add(1)
 		res, err := a.lm.JSON(ctx, system, user, llm.Options{MaxTokens: maxOut})
@@ -431,21 +450,37 @@ func (a *App) ReviewPR(ctx context.Context, repo string, number int, force bool)
 	findings, evidenceDropped = a.verifyFindings(ctx, meta, findings)
 	dropped = append(dropped, evidenceDropped...)
 
+	findings = mergeCarried(findings, carried)
+	var resolvedList []string
+	if incremental {
+		resolvedList = resolvedIDs(priorOpen, findings, parsed, touchedResolved)
+	}
+
+	// Sort by severity before choosing inline comments, so the 50-comment
+	// budget goes to the most important findings, not the first files.
+	sort.SliceStable(findings, func(i, j int) bool {
+		return severityOrder(findings[i].Severity) > severityOrder(findings[j].Severity)
+	})
+
 	verdict := review.Decide(findings, rc.BlockOn)
+	inlinePosted := min(len(findings), maxInline)
 	summary := review.Summary(review.SummaryInput{
-		Meta:        meta,
-		Findings:    findings,
-		Verdict:     verdict,
-		Dropped:     len(dropped),
-		Model:       modelUsed,
-		Handle:      a.cfg.Bot.Handle,
-		Truncated:   truncated,
-		Failed:      failed,
-		Sections:    len(sections),
-		Incremental: incremental,
-		Commit:      pr.Head.SHA,
-		Duration:    time.Since(started),
-		RepoURL:     a.cfg.Bot.RepoURL,
+		Meta:         meta,
+		Findings:     findings,
+		Verdict:      verdict,
+		Dropped:      len(dropped),
+		Model:        modelUsed,
+		Handle:       a.cfg.Bot.Handle,
+		Truncated:    truncated,
+		Failed:       failed,
+		Sections:     len(sections),
+		Incremental:  incremental,
+		SinceSHA:     since,
+		ResolvedIDs:  resolvedList,
+		InlinePosted: inlinePosted,
+		Commit:       pr.Head.SHA,
+		Duration:     time.Since(started),
+		RepoURL:      a.cfg.Bot.RepoURL,
 	})
 	if len(summary) > maxBodyChars {
 		summary = summary[:maxBodyChars]
@@ -455,6 +490,11 @@ func (a *App) ReviewPR(ctx context.Context, repo string, number int, force bool)
 	for i, f := range findings {
 		if i >= maxInline {
 			break
+		}
+		if f.Carried {
+			// Carried findings anchor to the previous head; their lines are
+			// not in this incremental diff, so an inline comment would 422.
+			continue
 		}
 		comments = append(comments, githubx.ReviewComment{
 			Path: f.File, Line: f.Line, Side: "RIGHT", Body: review.InlineBody(f),
@@ -511,7 +551,8 @@ func (a *App) ReviewPR(ctx context.Context, repo string, number int, force bool)
 // instead of leaving the author with no signal. The message deliberately does
 // not mention the bot handle so it cannot trigger a command loop.
 func (a *App) reportReviewFailure(ctx context.Context, repo string, number int, reason string) {
-	body := fmt.Sprintf("## 🔎 Ekravo Review — review failed\n\nI could not complete this review: %s. Nothing was approved or merged. Run the review command again to retry.\n", reason)
+	body := review.FailureBlock(number, repo, reason) +
+		fmt.Sprintf("\n## 🔎 Ekravo Review — review failed\n\nI could not complete this review: %s. Nothing was approved or merged. Run the review command again to retry.\n", reason)
 	if _, err := a.gh.CreateIssueComment(ctx, repo, number, body); err != nil {
 		a.log.Warn("could not post review failure comment", "repo", repo, "pr", number, "err", err)
 	}
@@ -589,9 +630,16 @@ func (a *App) maybeAutoMerge(ctx context.Context, repo string, pr *githubx.PullR
 	return true
 }
 
+// deletePrevious removes a stale review only when re-reviewing the SAME head
+// (a forced recheck), where keeping both would duplicate findings on identical
+// lines. When the head moved, the previous review stays: it is the visible
+// history an agent compares rounds against, and the new review's machine block
+// reports which finding IDs were resolved. GitHub counts only the latest
+// review per reviewer for gating, so an old REQUEST_CHANGES cannot block a
+// later APPROVE.
 func (a *App) deletePrevious(ctx context.Context, repo string, pr *githubx.PullRequest, force bool) {
 	prev, ok, err := a.st.LatestReview(ctx, repo, pr.Number)
-	if err != nil || !ok || prev.ReviewID == 0 || (!force && prev.HeadSHA == pr.Head.SHA) {
+	if err != nil || !ok || prev.ReviewID == 0 || prev.HeadSHA != pr.Head.SHA || !force {
 		return
 	}
 	if err := a.gh.DeleteReview(ctx, repo, pr.Number, prev.ReviewID); err != nil {
@@ -601,13 +649,13 @@ func (a *App) deletePrevious(ctx context.Context, repo string, pr *githubx.PullR
 
 // diffFor picks an incremental comparison when the PR moved since the last
 // review, otherwise the full diff. Empty legacy SHAs always mean full diff.
-func (a *App) diffFor(ctx context.Context, repo string, pr *githubx.PullRequest, force bool) ([]githubx.ChangedFile, bool, string, error) {
-	prev, ok, err := a.st.LatestReview(ctx, repo, pr.Number)
-	if err != nil {
-		return nil, false, "", err
+// prior may be nil; it is the already-loaded previous review record.
+func (a *App) diffFor(ctx context.Context, repo string, pr *githubx.PullRequest, force bool, prior *store.Review) ([]githubx.ChangedFile, bool, string, error) {
+	if prior == nil {
+		prior = a.loadPrior(ctx, repo, pr.Number)
 	}
 
-	if !force && ok && prev.HeadSHA != "" && prev.HeadSHA != pr.Head.SHA && a.cfg.Bot.RecheckUpdated {
+	if prev := prior; !force && prev != nil && prev.HeadSHA != "" && prev.HeadSHA != pr.Head.SHA && a.cfg.Bot.RecheckUpdated {
 		files, err := a.gh.CompareFiles(ctx, repo, prev.HeadSHA, pr.Head.SHA)
 		if err == nil && len(files) > 0 {
 			return files, true, prev.HeadSHA, nil

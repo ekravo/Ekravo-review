@@ -7,6 +7,11 @@ It reads the diff, pulls the surrounding code from the base commit, and posts
 findings on the exact lines that changed. The verdict is computed in code from
 the validated findings, so the model cannot announce an approval on its own.
 
+Built for the agent loop: most PRs are opened by AI coding agents that read the
+review, fix, push, and repeat until green. Every review carries a hidden
+machine-readable block with a stable status enum and finding IDs — see
+[docs/AGENT_LOOP.md](docs/AGENT_LOOP.md) for the contract.
+
 ## Run
 
 You need Go 1.26.10+, a GitHub App (or a personal token) and an [Ekravo](https://ekravo.com)

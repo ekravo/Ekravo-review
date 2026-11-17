@@ -77,6 +77,31 @@ func TestValidateDeduplicates(t *testing.T) {
 	}
 }
 
+func TestValidateDropsLowConfidence(t *testing.T) {
+	found := []Finding{
+		{File: "app/main.go", Line: 2, Severity: High, Category: "bug", Title: "guess", Fix: "f", Confidence: 0.3},
+		{File: "app/main.go", Line: 3, Severity: High, Category: "bug", Title: "sure", Fix: "f", Confidence: 0.9},
+	}
+	kept, dropped := Validate(found, files(t), 10)
+	if len(kept) != 1 || kept[0].Title != "sure" {
+		t.Fatalf("kept = %+v", kept)
+	}
+	if len(dropped) != 1 || dropped[0].Reason != "confidence below 0.6" {
+		t.Fatalf("dropped = %+v", dropped)
+	}
+}
+
+func TestValidateUnknownSeverityDefaultsLow(t *testing.T) {
+	found := []Finding{{File: "app/main.go", Line: 2, Severity: "blocker", Category: "bug", Title: "weird severity", Fix: "f"}}
+	kept, _ := Validate(found, files(t), 10)
+	if len(kept) != 1 || kept[0].Severity != Low {
+		t.Fatalf("kept = %+v, want severity low", kept)
+	}
+	if v := Decide(kept, "high"); v.Decision != "suggestions" {
+		t.Fatalf("unknown severity must not become blocking: %+v", v)
+	}
+}
+
 func TestDecideRespectsBlockOn(t *testing.T) {
 	critical := []Finding{{Severity: Critical}, {Severity: Low}}
 
@@ -105,8 +130,8 @@ func TestReviewEventGating(t *testing.T) {
 	if got := ReviewEvent("changes", true); got != "REQUEST_CHANGES" {
 		t.Errorf("changes = %s", got)
 	}
-	if got := ReviewEvent("suggestions", true); got != "COMMENT" {
-		t.Errorf("suggestions = %s", got)
+	if got := ReviewEvent("suggestions", true); got != "APPROVE" {
+		t.Errorf("suggestions = %s, want APPROVE (non-blocking notes must not stall an agent waiting for approval)", got)
 	}
 }
 
