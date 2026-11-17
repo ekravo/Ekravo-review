@@ -143,8 +143,9 @@ func (p *Poller) scanComments(ctx context.Context, repo string) {
 		if c.CreatedAt.After(watermark) {
 			watermark = c.CreatedAt
 		}
-		if c.User.Login == p.cfg.Bot.Handle {
-			continue // never execute our own comments
+		if strings.EqualFold(c.User.Login, p.cfg.Bot.Handle) ||
+			strings.EqualFold(c.User.Login, p.cfg.Bot.Handle+"[bot]") {
+			continue // never execute our own comments (App logins end in [bot])
 		}
 		number, ok := pullNumber(c.IssueURL)
 		if !ok {

@@ -1,6 +1,8 @@
 package review
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -59,6 +61,18 @@ type Finding struct {
 	// Evidence is set only when a finding was checked against web sources.
 	Evidence     *Evidence `json:"evidence,omitempty"`
 	EvidenceNote string    `json:"evidence_note,omitempty"`
+
+	// Carried marks an open finding brought forward from an earlier review
+	// round because the new commits did not resolve it.
+	Carried bool `json:"carried,omitempty"`
+}
+
+// ID returns a stable identity for a finding across review rounds: the same
+// defect on the same added line keeps the same ID, so agents can track what
+// is new, still open, and resolved.
+func (f Finding) ID() string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%d|%s|%s", f.File, f.Line, f.Category, strings.ToLower(f.Title))))
+	return "f-" + hex.EncodeToString(sum[:6])
 }
 
 // Dropped records a finding removed by validation, for logs and metrics.
@@ -154,7 +168,9 @@ func Validate(findings []Finding, files []*diff.File, max int) ([]Finding, []Dro
 		}
 
 		if f.Severity != Critical && f.Severity != High && f.Severity != Medium && f.Severity != Low {
-			f.Severity = Medium
+			// An unknown severity is a model formatting failure, not evidence
+			// of impact; default to the least blocking level.
+			f.Severity = Low
 		}
 		if !ValidCategory(f.Category) {
 			f.Category = "quality"
@@ -174,6 +190,10 @@ func Validate(findings []Finding, files []*diff.File, max int) ([]Finding, []Dro
 		}
 		if f.Confidence > 1 {
 			f.Confidence = 1
+		}
+		if f.Confidence < 0.6 {
+			dropped = append(dropped, Dropped{f, "confidence below 0.6"})
+			continue
 		}
 
 		line, ok := anchor(target, f.Line)
@@ -295,6 +315,8 @@ type Verdict struct {
 	Counts   map[Severity]int
 	Blocking int
 	Reason   string
+	// BlockOn is the effective severity policy the decision was made under.
+	BlockOn string
 }
 
 // Decide applies the repo's block_on policy. A model cannot approve code on
@@ -304,9 +326,10 @@ func Decide(findings []Finding, blockOn string) Verdict {
 	threshold, ok := rules[blockOn]
 	if !ok {
 		threshold = 3
+		blockOn = "high"
 	}
 
-	v := Verdict{Counts: map[Severity]int{}}
+	v := Verdict{Counts: map[Severity]int{}, BlockOn: blockOn}
 	for _, f := range findings {
 		v.Counts[f.Severity]++
 		if severityRank(f.Severity) >= threshold {
@@ -328,13 +351,25 @@ func Decide(findings []Finding, blockOn string) Verdict {
 	return v
 }
 
-// ReviewEvent maps a verdict to the GitHub review event.
+// Blocking reports whether one finding meets the effective block_on policy.
+func Blocking(f Finding, blockOn string) bool {
+	rules := map[string]int{"none": 99, "critical": 4, "high": 3, "medium": 2, "low": 1}
+	threshold, ok := rules[blockOn]
+	if !ok {
+		threshold = 3
+	}
+	return severityRank(f.Severity) >= threshold
+}
+
+// ReviewEvent maps a verdict to the GitHub review event. Suggestions are
+// non-blocking, so they APPROVE: an agent waiting for approval must not loop
+// forever fixing optional notes while each fix attracts fresh nits.
 func ReviewEvent(decision string, autoApprove bool) string {
 	if !autoApprove {
 		return "COMMENT"
 	}
 	switch decision {
-	case "approve":
+	case "approve", "suggestions":
 		return "APPROVE"
 	case "changes":
 		return "REQUEST_CHANGES"

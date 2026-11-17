@@ -34,6 +34,7 @@ type Pool struct {
 	workers  int
 	mu       sync.Mutex
 	inflight map[string]struct{}
+	pending  map[string]Job
 	closed   bool
 	wg       sync.WaitGroup
 }
@@ -54,6 +55,7 @@ func New(workers, capacity int, log *slog.Logger) *Pool {
 		ch:       make(chan item, capacity),
 		workers:  workers,
 		inflight: map[string]struct{}{},
+		pending:  map[string]Job{},
 	}
 }
 
@@ -71,13 +73,28 @@ func (p *Pool) Start(ctx context.Context) {
 }
 
 func (p *Pool) run(ctx context.Context, it item) {
+	for {
+		p.runOnce(ctx, it)
+		p.mu.Lock()
+		job, ok := p.pending[it.key]
+		if !ok {
+			delete(p.inflight, it.key)
+			p.mu.Unlock()
+			return
+		}
+		// A push arrived mid-run: rerun with the latest job in this worker,
+		// keeping the key inflight so further joins keep coalescing.
+		delete(p.pending, it.key)
+		p.mu.Unlock()
+		it.job = job
+	}
+}
+
+func (p *Pool) runOnce(ctx context.Context, it item) {
 	defer func() {
 		if r := recover(); r != nil {
 			p.log.Error("job panicked", "key", it.key, "panic", r)
 		}
-		p.mu.Lock()
-		delete(p.inflight, it.key)
-		p.mu.Unlock()
 	}()
 	it.job(ctx)
 }
@@ -88,36 +105,37 @@ func (p *Pool) Submit(key string, job Job) bool {
 	return p.enqueue(key, job, false) == nil
 }
 
-// SubmitOrJoin enqueues a job and treats an already-queued key as accepted,
-// because the queued work already covers this delivery. Only a full or closed
-// queue is an error, which lets the HTTP layer return 503 so GitHub redelivers.
+// SubmitOrJoin enqueues a job and treats an already-queued key as accepted by
+// coalescing: the latest job is kept pending and runs once the current job for
+// that key finishes, so a push arriving mid-review is never lost. Only a full
+// or closed queue is an error, which lets the HTTP layer return 503 so GitHub
+// redelivers.
 func (p *Pool) SubmitOrJoin(key string, job Job) error {
 	return p.enqueue(key, job, true)
 }
 
 func (p *Pool) enqueue(key string, job Job, join bool) error {
+	// The mutex stays held across the channel send: Shutdown closes the
+	// channel under the same lock, so a send can never race the close.
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.closed {
-		p.mu.Unlock()
 		return ErrClosed
 	}
 	if _, busy := p.inflight[key]; busy {
-		p.mu.Unlock()
 		if join {
+			p.pending[key] = job // coalesce to the latest delivery
 			return nil
 		}
 		return errBusy
 	}
 	p.inflight[key] = struct{}{}
-	p.mu.Unlock()
 
 	select {
 	case p.ch <- item{key: key, job: job}:
 		return nil
 	default:
-		p.mu.Lock()
 		delete(p.inflight, key)
-		p.mu.Unlock()
 		p.log.Warn("queue full, rejecting job", "key", key)
 		return ErrFull
 	}

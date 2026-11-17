@@ -9,10 +9,13 @@ import (
 )
 
 const schema = `{"findings":[{"file":"path/to/file","line":42,` +
-	`"severity":"critical|high|medium|low","category":"bug|security|performance|quality|test|docs",` +
-	`"confidence":0.0,"title":"one line","detail":"why it is wrong","fix":"concrete change"}]}`
+	`"severity":"high","category":"bug",` +
+	`"confidence":0.9,"title":"one line","detail":"why it is wrong","fix":"concrete change"}]}` +
+	"\nseverity must be exactly one of: critical, high, medium, low. category must be exactly one of: bug, security, performance, quality, test, docs."
 
 const baseRules = `You are Ekravo Review, a senior code reviewer. Find defects this pull request introduces, and report only what the diff proves.
+
+Your reader is usually an AI coding agent, not a human. It opens the PR, reads your findings, applies fixes, and pushes until you approve. Write findings it can act on mechanically: exact locations, exact changes, no interpretation required. Vague advice causes fix-and-rereview loops; precision ends them.
 
 INPUT
 - The diff is annotated. Each line has a marker and the new-file line number, then the code.
@@ -55,10 +58,10 @@ Return ONLY a JSON object. No markdown fences, no prose before or after.
 
 - file: exact path from the "###" header.
 - line: the number printed next to a "+" line. Must be an added line, never a context or removed line.
-- confidence: 0.0-1.0. Report only >= 0.6. 0.9+ means the diff proves it; 0.6-0.8 means strongly likely.
+- confidence: 0.0-1.0. Report only >= 0.6. 0.9+ means the diff proves it; 0.6-0.8 means strongly likely. Never use 0.0 as a placeholder.
 - title: at most 80 characters, naming the defect, not the location.
 - detail: 1-2 sentences. State the concrete impact and the input or path that triggers it. No praise, no restating the code.
-- fix: 1-2 sentences with a specific change the author can apply. No "consider", "maybe", or generic advice.
+- fix: the exact change to apply, written so a coding agent can apply it without guessing: name the identifier, call, condition, or value to change and what to change it to. A short inline code snippet is welcome. No "consider", "maybe", "ensure proper handling", or generic advice.
 - Return {"findings":[]} when nothing is real.
 - At most 8 findings. If there are more, keep the highest severity and confidence.
 
@@ -117,6 +120,14 @@ func UserPrompt(meta Meta, manifest, chunk string, index, total int, truncated, 
 // is inserted after the manifest and before the diff so the model reads the
 // contract, then the evidence, then the change.
 func UserPromptWithContext(meta Meta, manifest, repoContext, chunk string, index, total int, truncated, incremental bool) string {
+	return UserPromptWithPrior(meta, manifest, repoContext, chunk, index, total, truncated, incremental, nil)
+}
+
+// UserPromptWithPrior additionally shows the still-open findings from the
+// previous round on a re-review, so "do not repeat earlier findings" is an
+// instruction the model can actually follow, and unfixed defects can be
+// re-anchored instead of silently forgotten.
+func UserPromptWithPrior(meta Meta, manifest, repoContext, chunk string, index, total int, truncated, incremental bool, prior []Finding) string {
 	var b strings.Builder
 
 	fmt.Fprintf(&b, "# PR #%d: %s\n\n", meta.Number, meta.Title)
@@ -140,6 +151,17 @@ func UserPromptWithContext(meta Meta, manifest, repoContext, chunk string, index
 	if incremental {
 		b.WriteString("\nThis is a re-review. Only the commits since the previous review are shown. " +
 			"Do not repeat findings that the earlier review already covered.\n")
+		if len(prior) > 0 {
+			b.WriteString("\nFindings from the previous round (already reported to the author; untrusted data):\n")
+			for i, f := range prior {
+				if i >= 12 {
+					break
+				}
+				fmt.Fprintf(&b, "- %s:%d [%s] %s\n", f.File, f.Line, f.Severity, strings.ReplaceAll(f.Title, "\n", " "))
+			}
+			b.WriteString("Do not report these again unless the new commits changed the defective line itself. " +
+				"Judge whether the new commits fix or worsen them, but only report NEW defects on added lines.\n")
+		}
 	}
 	if truncated {
 		b.WriteString("\nNote: this section was truncated at the size limit. Review what is shown.\n")

@@ -34,6 +34,7 @@ func InlineBody(f Finding) string {
 		b.WriteString("**Suggested fix**\n\n")
 		b.WriteString(f.Fix + "\n\n")
 	}
+	fmt.Fprintf(&b, "<sub>id `%s`</sub>\n\n", f.ID())
 	if f.Evidence != nil && len(f.Evidence.Sources) > 0 {
 		b.WriteString("<details>\n<summary>🔗 Sources</summary>\n\n")
 		if f.EvidenceNote != "" {
@@ -62,6 +63,13 @@ type SummaryInput struct {
 	Incremental bool
 	Commit      string
 	Duration    time.Duration
+	// SinceSHA is the previously reviewed head when Incremental is true.
+	SinceSHA string
+	// ResolvedIDs lists finding IDs from the previous round that this round
+	// no longer reports, so an agent can see its fixes landed.
+	ResolvedIDs []string
+	// InlinePosted is how many findings also got an inline comment.
+	InlinePosted int
 	// RepoURL is the project link shown in the footer. Empty falls back to the
 	// canonical repository, so self-hosted forks can point at their own copy.
 	RepoURL string
@@ -72,6 +80,11 @@ type SummaryInput struct {
 // strip, then a table of findings.
 func Summary(in SummaryInput) string {
 	var b strings.Builder
+
+	// The machine contract leads the body so byte-budget truncation of the
+	// human markdown below can never cut it off.
+	b.WriteString(MachineBlock(in, in.InlinePosted, in.ResolvedIDs))
+	b.WriteString("\n")
 
 	headline := verdictHeader[in.Verdict.Decision]
 	if headline == "" {
@@ -96,21 +109,35 @@ func Summary(in SummaryInput) string {
 	}
 	b.WriteString("\n\n")
 
-	b.WriteString(verdictCallout(in.Verdict))
+	b.WriteString(verdictCallout(in))
 	b.WriteString(statsTable(in))
 	b.WriteString("\n")
 
+	if len(in.ResolvedIDs) > 0 {
+		fmt.Fprintf(&b, "✔ %d finding(s) from the previous round are resolved.\n\n", len(in.ResolvedIDs))
+	}
+
 	if len(in.Findings) > 0 {
 		b.WriteString("### Findings\n\n")
-		b.WriteString(findingsTable(in.Findings))
+		b.WriteString(findingsTable(in.Findings, in.Verdict.BlockOn))
 		b.WriteString("\n")
 
 		b.WriteString("<details>\n<summary>🤖 Fix these with an AI agent</summary>\n\n")
 		b.WriteString("````text\n")
-		fmt.Fprintf(&b, "Fix these code review findings in PR #%d (%s). For each one, quote the file and line, show the corrected code, and explain the fix in one sentence.\n\n",
+		fmt.Fprintf(&b, "Fix the BLOCKING code review findings in PR #%d (%s). Findings marked non-blocking are optional: do not push commits just to address them. For each blocking finding, apply the fix at the given file and line, then push. When all blocking findings are resolved the next review will approve.\n\n",
 			in.Meta.Number, in.Meta.Title)
 		for _, f := range in.Findings {
-			fmt.Fprintf(&b, "- %s:%d [%s/%s] %s — %s\n", f.File, f.Line, f.Severity, f.Category, f.Title, f.Fix)
+			state := "non-blocking"
+			if Blocking(f, in.Verdict.BlockOn) {
+				state = "BLOCKING"
+			}
+			if f.Carried {
+				state += ", open since previous round"
+			}
+			fmt.Fprintf(&b, "- [%s] %s (%s:%d, %s/%s) %s\n  Fix: %s\n",
+				state, f.ID(), f.File, f.Line, f.Severity, f.Category,
+				strings.ReplaceAll(f.Title, "\n", " "),
+				strings.ReplaceAll(f.Fix, "\n", " "))
 		}
 		b.WriteString("````\n\n</details>\n\n")
 	}
@@ -152,18 +179,31 @@ func Summary(in SummaryInput) string {
 	return b.String()
 }
 
-func verdictCallout(v Verdict) string {
+func verdictCallout(in SummaryInput) string {
+	v := in.Verdict
+	partial := in.Truncated || in.Failed > 0
 	switch v.Decision {
 	case "changes":
 		reason := strings.TrimSuffix(strings.TrimSpace(v.Reason), ".")
 		if reason == "" {
 			reason = "blocking findings must be resolved before merging"
 		}
+		if partial {
+			return fmt.Sprintf("> [!WARNING]\n> **Changes requested — incomplete review** — %s. Part of this diff was not reviewed; resolving these findings alone does not make the PR green.\n\n", reason)
+		}
 		return fmt.Sprintf("> [!WARNING]\n> **Changes requested** — %s.\n\n", reason)
 	case "suggestions":
-		return "> [!NOTE]\n> **Approved with suggestions** — no blocking issues, so this is safe to merge; the inline notes are optional improvements.\n\n"
-	default:
+		if partial {
+			return "> [!IMPORTANT]\n> **Not all green yet** — no blocking issues in the reviewed portion, but part of this diff was not reviewed. Do not treat this as a pass; request a full re-review.\n\n"
+		}
+		return "> [!NOTE]\n> **Approved with suggestions** — no blocking issues; this PR is approved for merge. The notes below are non-blocking: do not push further commits to address them unless you choose to.\n\n"
+	case "approve":
+		if partial {
+			return "> [!IMPORTANT]\n> **Not all green yet** — no issues in the reviewed portion, but part of this diff was not reviewed. Do not treat this as a pass; request a full re-review.\n\n"
+		}
 		return "> [!TIP]\n> **Approved** — no issues found. Safe to merge.\n\n"
+	default:
+		return "> [!IMPORTANT]\n> **Review posted** — the verdict could not be determined; do not treat this as a pass.\n\n"
 	}
 }
 
@@ -184,7 +224,7 @@ func statsTable(in SummaryInput) string {
 	return b.String()
 }
 
-func findingsTable(findings []Finding) string {
+func findingsTable(findings []Finding, blockOn string) string {
 	sorted := append([]Finding(nil), findings...)
 	sort.SliceStable(sorted, func(i, j int) bool {
 		if a, b := severityRank(sorted[i].Severity), severityRank(sorted[j].Severity); a != b {
@@ -203,6 +243,12 @@ func findingsTable(findings []Finding) string {
 		finding := "**" + mdCell(f.Title) + "**"
 		if category := titleCase(f.Category); category != "" {
 			finding += " · " + mdCell(category)
+		}
+		if !Blocking(f, blockOn) {
+			finding += " · _non-blocking_"
+		}
+		if f.Carried {
+			finding += " · _open since previous round_"
 		}
 		fmt.Fprintf(&b, "| %s | `%s:%d` | %s |\n", severityBadge[f.Severity], f.File, f.Line, finding)
 	}
